@@ -50,12 +50,12 @@ class TurboM(Turbo1):
 
     def __init__(
         self,
-        f,
         lb,
         ub,
         n_init,
         max_evals,
         n_trust_regions,
+        f=None,
         batch_size=1,
         verbose=True,
         use_ard=True,
@@ -139,6 +139,103 @@ class TurboM(Turbo1):
             y_cand[i, j, :] = np.inf
 
         return X_next, idx_next
+
+    def get_init_candidates(self):
+        X_init = latin_hypercube(self.n_init, self.dim)
+        X_init = from_unit_cube(X_init, self.lb, self.ub)
+        return X_init
+    
+    def init(self, X_init, fX_init, tr):
+        # Create initial points for each TR
+        
+        # fX_init = np.array([[self.f(x)] for x in X_init])
+
+        i = tr
+
+        # Update budget and set as initial data for this TR
+        self.X = np.vstack((self.X, X_init))
+        self.fX = np.vstack((self.fX, fX_init))
+        self._idx = np.vstack((self._idx, i * np.ones((self.n_init, 1), dtype=int)))
+        self.n_evals += self.n_init
+
+    def get_optimize_candidates(self):
+        # Generate candidates from each TR
+        X_cand = np.zeros((self.n_trust_regions, self.n_cand, self.dim))
+        y_cand = np.inf * np.ones((self.n_trust_regions, self.n_cand, self.batch_size))
+        for i in range(self.n_trust_regions):
+            idx = np.where(self._idx == i)[0]  # Extract all "active" indices
+
+            # Get the points, values the active values
+            X = deepcopy(self.X[idx, :])
+            X = to_unit_cube(X, self.lb, self.ub)
+
+            # Get the values from the standardized data
+            fX = deepcopy(self.fX[idx, 0].ravel())
+
+            # Don't retrain the model if the training data hasn't changed
+            n_training_steps = 0 if self.hypers[i] else self.n_training_steps
+
+            # Create new candidates
+            X_cand[i, :, :], y_cand[i, :, :], self.hypers[i] = self._create_candidates(
+                X, fX, length=self.length[i], n_training_steps=n_training_steps, hypers=self.hypers[i]
+            )
+
+        # Select the next candidates
+        X_next, idx_next = self._select_candidates(X_cand, y_cand)
+        assert X_next.min() >= 0.0 and X_next.max() <= 1.0
+
+        # Undo the warping
+        X_next = from_unit_cube(X_next, self.lb, self.ub)
+
+        return X_next, idx_next
+
+    def optimize_one(self, X_next, idx_next, fX_next):
+
+        # Evaluate batch
+        # fX_next = np.array([[self.f(x)] for x in X_next])
+
+        # Update trust regions
+        for i in range(self.n_trust_regions):
+            idx_i = np.where(idx_next == i)[0]
+            if len(idx_i) > 0:
+                self.hypers[i] = {}  # Remove model hypers
+                fX_i = fX_next[idx_i]
+
+                if self.verbose and fX_i.min() < self.fX.min() - 1e-3 * math.fabs(self.fX.min()):
+                    n_evals, fbest = self.n_evals, fX_i.min()
+                    print(f"{n_evals}) New best @ TR-{i}: {fbest:.4}")
+                    sys.stdout.flush()
+                self._adjust_length(fX_i, i)
+
+        # Update budget and append data
+        self.n_evals += self.batch_size
+        self.X = np.vstack((self.X, deepcopy(X_next)))
+        self.fX = np.vstack((self.fX, deepcopy(fX_next)))
+        self._idx = np.vstack((self._idx, deepcopy(idx_next)))
+
+    def if_restart(self, tr):
+        return self.length[tr] < self.length_min
+
+    def restart(self, X_init, fX_init, tr):
+
+        i = tr
+
+        idx_i = self._idx[:, 0] == i
+
+        if self.verbose:
+            n_evals, fbest = self.n_evals, self.fX[idx_i, 0].min()
+            print(f"{n_evals}) TR-{i} converged to: : {fbest:.4}")
+            sys.stdout.flush()
+
+        # Reset length and counters, remove old data from trust region
+        self.length[i] = self.length_init
+        self.succcount[i] = 0
+        self.failcount[i] = 0
+        self._idx[idx_i, 0] = -1  # Remove points from trust region
+        self.hypers[i] = {}  # Remove model hypers
+
+        # Append data to local history
+        self.init(X_init, fX_init, tr)
 
     def optimize(self):
         """Run the full optimization process."""
